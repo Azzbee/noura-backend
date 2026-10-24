@@ -58,6 +58,18 @@ class Settings(BaseSettings):
         "time_factor": 0.2,
     }
 
+    # Factor values for a street with no nearby safety features (0-1).
+    # Paris lights its public streets, so unknown lighting defaults to lit;
+    # an OSM lit=no tag still halves it. Originally 0.3/0.2/0.3/0.2/0.3, which
+    # rated the safest route in central Paris at night around 17/100.
+    BASE_SCORES: dict = {
+        "lighting": 0.3,
+        "police": 0.2,
+        "activity": 0.3,
+        "medical": 0.2,
+        "transport": 0.3,
+    }
+
     # Paris Bounding Box
     PARIS_BOUNDS: dict = {
         "north": 48.9022,

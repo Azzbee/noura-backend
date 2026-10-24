@@ -189,7 +189,14 @@ Returns fastest, safest, and balanced route options with comparison metrics.
 
 ## Safety Scoring Algorithm
 
-The safety score (0-100) considers:
+Routes get a **relative** safety score (0-100): every street segment around the
+trip is scored, then ranked against the others at the chosen hour; a route's
+score is the length-weighted average rank of the streets it uses, nudged down
+at night (x1.0 by day to x0.9 late at night). 100 means it only uses the safest
+streets nearby. The raw per-segment model below drives the ranking and the
+breakdown.
+
+The raw segment score considers:
 
 - **Lighting** (20%): Street lighting and well-lit areas
 - **Police Proximity** (20%): Distance to police stations

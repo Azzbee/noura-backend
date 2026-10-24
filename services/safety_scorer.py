@@ -84,11 +84,12 @@ class SafetyScorer:
         """Calculate safety score for a single point"""
 
         # Initialize scores
-        lighting_score = 0.3  # Base lighting score
-        police_score = 0.2  # Base police proximity
-        activity_score = 0.3  # Base activity level
-        medical_score = 0.2  # Base medical access
-        transport_score = 0.3  # Base transport access
+        b = settings.BASE_SCORES
+        lighting_score = b["lighting"]  # street with no lighting data
+        police_score = b["police"]
+        activity_score = b["activity"]
+        medical_score = b["medical"]
+        transport_score = b["transport"]
         danger_score = 1.0  # Start with no danger
 
         # Process each safety zone
@@ -376,11 +377,12 @@ class SafetyScorer:
         lons = np.asarray(lons, dtype=float)
         n = lats.shape[0]
 
-        lighting = np.full(n, 0.3)
-        police = np.full(n, 0.2)
-        activity = np.full(n, 0.3)
-        medical = np.full(n, 0.2)
-        transport = np.full(n, 0.3)
+        b = settings.BASE_SCORES
+        lighting = np.full(n, b["lighting"])
+        police = np.full(n, b["police"])
+        activity = np.full(n, b["activity"])
+        medical = np.full(n, b["medical"])
+        transport = np.full(n, b["transport"])
         danger = np.ones(n)
 
         zones = [z for z in safety_zones if self._zone_applies(z, time_of_day)]

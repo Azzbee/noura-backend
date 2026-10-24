@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import networkx as nx
 import numpy as np
 from scipy.spatial import cKDTree
+from scipy.stats import rankdata
 
 from config import settings
 from models import (
@@ -237,6 +238,10 @@ class RouteCalculator:
         scores = res["score"]
         lo, hi = np.percentile(scores, 5), np.percentile(scores, 95)
         res["risk"] = np.clip((hi - scores) / max(hi - lo, 1e-6), 0.0, 1.0)
+        # Percentile of each segment among the streets around this trip at
+        # this hour (0 = least safe street nearby, 100 = safest). Routes are
+        # scored on this, see _summarise.
+        res["pct"] = (rankdata(scores, method="average") - 0.5) / len(scores) * 100
         keys = list(res.keys())
         out = {}
         for i, (u, v, _) in enumerate(edges):
@@ -266,7 +271,7 @@ class RouteCalculator:
         """Length-weighted safety over the edges actually walked."""
         total = 0.0
         acc = {k: 0.0 for k in (
-            "score", "lighting", "road_type", "activity", "police_proximity",
+            "score", "pct", "lighting", "road_type", "activity", "police_proximity",
             "cctv_coverage", "safe_landmarks", "time_factor")}
         for u, v in zip(path, path[1:]):
             d = self.graph[u][v]["distance"]
@@ -276,10 +281,14 @@ class RouteCalculator:
                 acc[k] += rec[k] * d
         if total <= 0:
             rec = next(iter(edge_scores.values()))
-            return 0.0, rec["score"], SafetyBreakdown(**{
-                k: min(1.0, rec[k]) for k in acc if k != "score"})
+            return 0.0, rec["pct"], SafetyBreakdown(**{
+                k: min(1.0, rec[k]) for k in acc if k not in ("score", "pct")})
         avg = {k: acc[k] / total for k in acc}
-        score = avg.pop("score")
+        avg.pop("score")  # raw model score, kept per segment for routing
+        # Relative safety: length-weighted percentile of the streets walked,
+        # against all streets around the trip at this hour, nudged down at
+        # night (time_factor 1.0 day ... 0.6 late night -> x1.0 ... x0.9).
+        score = avg.pop("pct") * (0.75 + 0.25 * avg["time_factor"])
         if total > 5000:  # same long-route penalty as SafetyScorer.score_route
             score *= 1 - min(0.1, (total - 5000) / 50000)
         breakdown = SafetyBreakdown(**{k: max(0.0, min(1.0, v)) for k, v in avg.items()})

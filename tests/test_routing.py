@@ -90,6 +90,7 @@ def test_safest_route_avoids_danger_zone_and_fastest_does_not():
     assert min_dist_to_zone(res.fastest.geometry) < 10  # straight through
     assert min_dist_to_zone(res.safest.geometry) > 250  # goes around it
     assert res.safest.safety_score > res.fastest.safety_score
+    assert 0 <= res.fastest.safety_score <= 100 and 0 <= res.safest.safety_score <= 100
     assert res.safest.distance_m > res.fastest.distance_m
     assert res.comparison["safety_improvement_pct"] > 0
 
