@@ -9,6 +9,7 @@ from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from config import settings
@@ -100,7 +101,8 @@ async def health_check():
     uptime = time.time() - app_start_time if app_start_time else 0
 
     return HealthResponse(
-        status="healthy" if route_calculator.graph_loaded else "degraded",
+        # "ok" is what the app's RouteServiceStatus badge expects
+        status="ok" if route_calculator.graph_loaded else "degraded",
         graph_loaded=route_calculator.graph_loaded,
         node_count=route_calculator.node_count,
         edge_count=route_calculator.edge_count,
@@ -254,11 +256,13 @@ async def compare_routes(request: RouteComparisonRequest):
             )
 
         # Calculate alternative routes
-        comparison = route_calculator.calculate_alternative_routes(
+        comparison = await run_in_threadpool(
+            route_calculator.calculate_alternative_routes,
             request.start,
             request.end,
             safety_zones,
             request.time_of_day,
+            request.preferences,
         )
 
         return comparison

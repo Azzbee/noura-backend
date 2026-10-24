@@ -119,7 +119,7 @@ POST /api/route
 ```json
 {
   "route_id": "route-1234567890",
-  "geometry": [[48.8566, 2.3522], ...],
+  "geometry": [[2.3522, 48.8566], ...],
   "distance_m": 1250,
   "duration_s": 900,
   "safety_score": 78.5,
@@ -157,11 +157,11 @@ Returns fastest, safest, and balanced route options with comparison metrics.
 
 ### Services
 
-1. **OSMFetcher**: Fetches data from OpenStreetMap Overpass API
-   - Police stations, hospitals, metro stations
-   - Pharmacies, 24h services
-   - Well-lit areas, busy streets
-   - Danger zones (20km radius)
+1. **OSMFetcher**: Safety zones and the street network
+   - Curated Paris zones (`data/paris_safety_zones.json`, the same list the app shows)
+   - Live OpenStreetMap features from one Overpass query per area: police,
+     hospitals, metro, pharmacies, 24h services, nightlife, construction
+   - Walking street network for the whole city, cached gzipped in `data/`
 
 2. **SafetyScorer**: Calculates safety scores for points and routes
    - Time-based multipliers
@@ -169,11 +169,14 @@ Returns fastest, safest, and balanced route options with comparison metrics.
    - User preference weighting
    - Route segment analysis
 
-3. **RouteCalculator**: NetworkX-based routing with safety weighting
-   - Graph building from OSM data
-   - Safety-weighted edge costs
-   - Alternative route generation
-   - Distance and duration calculations
+3. **RouteCalculator**: safety-weighted A* over the street graph
+   - Ways joined at shared OSM nodes into one connected walking network
+   - Each street segment scored (zones, OSM `lit` tag, street type, time of day,
+     user preferences), vectorised with NumPy
+   - Edge cost = length x (1 + gain x risk x safety_weight), where risk ranks the
+     segment against the others around the trip; 0 = shortest path
+   - Fastest / balanced / safest computed on the same scored window
+   - Geometry returned as `[lng, lat]` pairs (GeoJSON order, like OSRM)
 
 ### Data Flow
 
@@ -210,6 +213,16 @@ Key settings in `config.py`:
 - `MAX_ROUTE_DISTANCE`: Maximum 10km route distance
 - `DEFAULT_WALKING_SPEED`: 1.4 m/s walking speed
 - `CACHE_TTL`: 1 hour cache duration
+
+## Tests
+
+```bash
+python -m pytest -q
+```
+
+Covers: vectorised scoring matches the per-point scorer, ways join into a
+connected graph, the safest route detours around a danger zone while the
+fastest goes through it, lit streets win at night, Overpass classification.
 
 ## Development
 

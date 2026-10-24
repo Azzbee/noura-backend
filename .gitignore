@@ -165,3 +165,5 @@ tmp/
 temp/
 *.tmp
 *.temp
+# Street network cache (downloaded on first start)
+data/paris_streets.json.gz

@@ -3,7 +3,11 @@ OpenStreetMap data fetcher service
 """
 
 import asyncio
+import gzip
+import json
 import logging
+import time
+from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 import httpx
 from cachetools import TTLCache
@@ -20,7 +24,7 @@ class OSMFetcher:
     def __init__(self):
         self.overpass_url = settings.OVERPASS_API_URL
         self.cache = TTLCache(maxsize=100, ttl=settings.CACHE_TTL)
-        self.client = httpx.AsyncClient(timeout=30.0)
+        self.client = httpx.AsyncClient(timeout=settings.OVERPASS_TIMEOUT + 30)
 
     async def __aenter__(self):
         return self
@@ -355,54 +359,153 @@ class OSMFetcher:
     async def fetch_all_safety_zones(
         self, lat: float, lng: float, radius: float = 500
     ) -> List[SafetyZone]:
-        """Fetch all safety zones around a location"""
-        cache_key = f"zones_{lat:.4f}_{lng:.4f}_{radius}"
+        """All safety zones around a location: the curated Paris zones plus
+        live OpenStreetMap features.
 
+        Everything comes from ONE Overpass query. The previous version sent
+        eight queries per request (in parallel, so Overpass answered most with
+        HTTP 429), one of them over a 20 km radius."""
+        radius = max(300.0, min(float(radius), 5000.0))
+        cache_key = f"zones_{lat:.3f}_{lng:.3f}_{int(radius // 250)}"
         if cache_key in self.cache:
-            logger.info(f"Returning cached zones for {cache_key}")
             return self.cache[cache_key]
 
-        # Fetch all zone types in parallel
-        tasks = [
-            self.fetch_police_stations(lat, lng, radius),
-            self.fetch_hospitals(lat, lng, radius),
-            self.fetch_metro_stations(lat, lng, radius),
-            self.fetch_pharmacies(lat, lng, radius),
-            self.fetch_24h_services(lat, lng, radius),
-            self.fetch_well_lit_areas(lat, lng),
-            self.fetch_busy_areas(lat, lng, radius),
-            self.fetch_danger_zones(lat, lng),  # Always 20km
-        ]
+        live: List[SafetyZone] = []
+        if settings.USE_LIVE_OSM_ZONES:
+            try:
+                live = await self._fetch_live_zones(lat, lng, radius)
+            except Exception as e:  # keep routing with curated data
+                logger.error(f"Error fetching live zones: {e}")
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        all_zones = []
-        for result in results:
-            if isinstance(result, list):
-                all_zones.extend(result)
-            else:
-                logger.error(f"Error fetching zones: {result}")
-
-        # Cache the results
+        all_zones = load_curated_zones() + live
         self.cache[cache_key] = all_zones
-
-        logger.info(f"Fetched {len(all_zones)} safety zones for {lat}, {lng}")
+        logger.info(
+            f"Using {len(all_zones)} safety zones around {lat:.4f},{lng:.4f} "
+            f"({len(live)} live from OSM)"
+        )
         return all_zones
+
+    async def _fetch_live_zones(self, lat: float, lng: float, radius: float) -> List[SafetyZone]:
+        r = int(radius)
+        a = f"(around:{r},{lat},{lng})"
+        query = f"""
+        [out:json][timeout:60];
+        (
+          nwr["amenity"="police"]{a};
+          nwr["amenity"="hospital"]{a};
+          nwr["healthcare"="hospital"]{a};
+          node["railway"="station"]{a};
+          node["railway"="subway_entrance"]{a};
+          nwr["amenity"="pharmacy"]{a};
+          node["opening_hours"="24/7"]{a};
+          node["amenity"~"^(nightclub|casino)$"]{a};
+          way["landuse"="construction"]{a};
+        );
+        out center tags;
+        """
+        elements = await self.fetch_overpass_data(query)
+        zones: List[SafetyZone] = []
+        seen = set()
+        for el in elements:
+            z = self._classify(el)
+            if z is None:
+                continue
+            key = (z.type, round(z.center[0], 4), round(z.center[1], 4))
+            if key in seen:
+                continue
+            seen.add(key)
+            zones.append(z)
+        return zones
+
+    @staticmethod
+    def _classify(el: Dict[str, Any]) -> Optional[SafetyZone]:
+        tags = el.get("tags", {})
+        lat = el.get("lat") or el.get("center", {}).get("lat")
+        lon = el.get("lon") or el.get("center", {}).get("lon")
+        if lat is None or lon is None:
+            return None
+        oid = f"{el.get('type', 'n')[0]}{el['id']}"
+        amenity = tags.get("amenity")
+        name = tags.get("name")
+
+        def zone(prefix, ztype, radius, default_name, when="always"):
+            return SafetyZone(
+                id=f"{prefix}-{oid}",
+                type=ztype,
+                center=[lat, lon],
+                radius=radius,
+                name=name or default_name,
+                time_relevance=when,
+            )
+
+        if amenity == "police":
+            return zone("police", SafetyZoneType.police_station, 150, "Police Station")
+        if amenity == "hospital" or tags.get("healthcare") == "hospital":
+            return zone("hospital", SafetyZoneType.hospital, 200, "Hospital")
+        if tags.get("railway") in ("station", "subway_entrance"):
+            z = zone("metro", SafetyZoneType.metro_station, 100, "Metro")
+            for prefix in ("Métro ", "Metro ", "Station ", "Gare "):
+                if z.name.startswith(prefix):
+                    z.name = z.name[len(prefix):].strip()
+            return z
+        if amenity == "pharmacy":
+            hours = tags.get("opening_hours", "")
+            return zone("pharmacy", SafetyZoneType.pharmacy, 100, "Pharmacy",
+                        "always" if "24/7" in hours else "day_only")
+        if amenity in ("nightclub", "casino"):
+            return zone("danger", SafetyZoneType.caution_area, 200, "Nightlife Area", "late_night")
+        if tags.get("landuse") == "construction":
+            return zone("danger", SafetyZoneType.danger_zone, 200, "Construction Site")
+        if tags.get("opening_hours") == "24/7":
+            return zone("24h", SafetyZoneType.open_24h, 100, "24 Hour Service")
+        return None
 
     async def get_street_network(
         self, bounds: Tuple[float, float, float, float]
     ) -> Dict[str, Any]:
-        """Fetch street network for routing"""
-        south, west, north, east = bounds
+        """Walking street network for routing, cached on disk.
 
+        The whole of Paris is a large download, so it is fetched once and
+        stored gzipped in data/ (see scripts/fetch_street_network.py)."""
+        cache = Path(settings.STREET_CACHE_PATH)
+        if cache.exists() and time.time() - cache.stat().st_mtime < settings.STREET_CACHE_MAX_AGE:
+            logger.info(f"Loading street network from {cache}")
+            with gzip.open(cache, "rt", encoding="utf-8") as f:
+                return json.load(f)
+
+        south, west, north, east = bounds
         query = f"""
-        [out:json][timeout:60];
+        [out:json][timeout:{settings.OVERPASS_TIMEOUT}][maxsize:1073741824];
         (
-          way["highway"~"primary|secondary|tertiary|residential|pedestrian|footway|path"]
+          way["highway"~"^(primary|secondary|tertiary|primary_link|secondary_link|tertiary_link|unclassified|residential|living_street|pedestrian|footway|path|steps|service|cycleway|track)$"]
             ({south},{west},{north},{east});
         );
         out geom;
         """
 
         elements = await self.fetch_overpass_data(query)
-        return {"elements": elements}
+        data = {"elements": elements}
+        if elements:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            with gzip.open(cache, "wt", encoding="utf-8") as f:
+                json.dump(data, f)
+            logger.info(f"Cached {len(elements)} ways to {cache}")
+        return data
+
+
+_CURATED: Optional[List[SafetyZone]] = None
+
+
+def load_curated_zones() -> List[SafetyZone]:
+    """Hand-curated Paris safety zones (same list the app shows on the map):
+    metro hubs, commissariats, hospitals, lit areas, caution and danger zones."""
+    global _CURATED
+    if _CURATED is None:
+        path = Path(settings.CURATED_ZONES_PATH)
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            _CURATED = [SafetyZone(**z) for z in raw]
+        except FileNotFoundError:
+            logger.warning(f"Curated zones file not found: {path}")
+            _CURATED = []
+    return list(_CURATED)

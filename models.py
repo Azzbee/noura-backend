@@ -39,7 +39,7 @@ class SafetyZone(BaseModel):
     """Safety zone information"""
     id: str
     type: SafetyZoneType
-    center: List[float] = Field(..., min_items=2, max_items=2)
+    center: List[float] = Field(..., min_length=2, max_length=2)
     radius: float = Field(..., gt=0)
     name: Optional[str] = None
     safety_score: Optional[float] = Field(None, ge=0, le=100)
@@ -70,9 +70,11 @@ class SafetyPreferences(BaseModel):
 class Route(BaseModel):
     """Route information"""
     route_id: str
-    geometry: List[List[float]] = Field(..., description="List of [lat, lng] coordinates")
-    distance_m: float = Field(..., gt=0)
-    duration_s: float = Field(..., gt=0)
+    geometry: List[List[float]] = Field(
+        ..., description="List of [lng, lat] coordinates (GeoJSON order, same as OSRM)"
+    )
+    distance_m: float = Field(..., ge=0)
+    duration_s: float = Field(..., ge=0)
     safety_score: float = Field(..., ge=0, le=100)
     safety_breakdown: Optional[SafetyBreakdown] = None
     warnings: List[str] = []

@@ -4,7 +4,9 @@ Safety scoring service for routes and locations
 
 import logging
 import math
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Sequence
+
+import numpy as np
 from datetime import datetime
 
 from models import (
@@ -318,4 +320,169 @@ class SafetyScorer:
             "safer_route": 1 if score1 >= score2 else 2,
             "safety_difference": abs(score1 - score2),
             "distance_difference": abs(dist1 - dist2),
+        }
+
+
+    # ------------------------------------------------------------------
+    # Vectorised scoring (used by the router to score thousands of street
+    # segments per request). Mirrors score_point() exactly; see
+    # tests/test_scoring.py which checks the two agree.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _zone_applies(zone: SafetyZone, time_of_day: TimeOfDay) -> bool:
+        if zone.time_relevance == "day_only" and time_of_day in (
+            TimeOfDay.night,
+            TimeOfDay.late_night,
+        ):
+            return False
+        if zone.time_relevance == "night_only" and time_of_day == TimeOfDay.day:
+            return False
+        return True
+
+    @staticmethod
+    def haversine_matrix(
+        lats: np.ndarray, lons: np.ndarray, zlats: np.ndarray, zlons: np.ndarray
+    ) -> np.ndarray:
+        """Distances in metres between N points and Z zone centres (N x Z)."""
+        R = 6371000.0
+        phi1 = np.radians(lats)[:, None]
+        phi2 = np.radians(zlats)[None, :]
+        dphi = phi2 - phi1
+        dlmb = np.radians(zlons)[None, :] - np.radians(lons)[:, None]
+        a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlmb / 2) ** 2
+        return 2 * R * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+
+    def score_points_array(
+        self,
+        lats: Sequence[float],
+        lons: Sequence[float],
+        safety_zones: List[SafetyZone],
+        time_of_day: TimeOfDay,
+        preferences: Optional[SafetyPreferences] = None,
+        lit: Optional[np.ndarray] = None,
+        road_type: Optional[np.ndarray] = None,
+        max_distance: float = 500.0,
+    ) -> dict:
+        """Score many points at once.
+
+        Returns a dict of numpy arrays: score (0-100) plus every breakdown
+        component. ``lit`` (+1 lit=yes, -1 lit=no, 0 unknown) and
+        ``road_type`` (0-1) are optional per-point street attributes taken
+        from OpenStreetMap; when omitted the result is identical to
+        score_point().
+        """
+        lats = np.asarray(lats, dtype=float)
+        lons = np.asarray(lons, dtype=float)
+        n = lats.shape[0]
+
+        lighting = np.full(n, 0.3)
+        police = np.full(n, 0.2)
+        activity = np.full(n, 0.3)
+        medical = np.full(n, 0.2)
+        transport = np.full(n, 0.3)
+        danger = np.ones(n)
+
+        zones = [z for z in safety_zones if self._zone_applies(z, time_of_day)]
+        if zones and n:
+            zlat = np.array([z.center[0] for z in zones])
+            zlon = np.array([z.center[1] for z in zones])
+            zrad = np.array([z.radius for z in zones])
+            ztype = np.array([z.type.value if hasattr(z.type, "value") else z.type for z in zones])
+
+            # Process in chunks to bound memory on large graphs
+            chunk = 4096
+            for start in range(0, n, chunk):
+                sl = slice(start, start + chunk)
+                d = self.haversine_matrix(lats[sl], lons[sl], zlat, zlon)
+                eff = d - zrad[None, :]
+                infl = np.where(eff <= 0, 1.0, np.clip(1.0 - eff / max_distance, 0.0, 1.0))
+
+                def best(t, factor=1.0):
+                    cols = ztype == t
+                    if not cols.any():
+                        return None
+                    return infl[:, cols].max(axis=1) * factor
+
+                for t, f, target in (
+                    ("police_station", 1.0, "police"),
+                    ("hospital", 0.8, "medical"),
+                    ("metro_station", 0.9, "transport"),
+                    ("metro_station", 0.7, "activity"),
+                    ("well_lit", 1.0, "lighting"),
+                    ("busy_street", 1.0, "activity"),
+                    ("pharmacy", 0.6, "medical"),
+                    ("open_24h", 0.8, "activity"),
+                    ("open_24h", 0.7, "lighting"),
+                ):
+                    v = best(t, f)
+                    if v is None:
+                        continue
+                    arr = {"police": police, "medical": medical, "transport": transport,
+                           "activity": activity, "lighting": lighting}[target]
+                    arr[sl] = np.maximum(arr[sl], v)
+
+                for t, f in (("caution_area", 0.3), ("danger_zone", 0.6)):
+                    v = best(t)
+                    if v is not None:
+                        danger[sl] = np.minimum(danger[sl], 1.0 - v * f)
+
+        # Street lighting recorded in OpenStreetMap (lit=yes / lit=no)
+        if lit is not None:
+            lit = np.asarray(lit)
+            lighting = np.where(lit > 0, np.maximum(lighting, 0.85), lighting)
+            lighting = np.where(lit < 0, lighting * 0.5, lighting)
+
+        time_multiplier = self.get_time_multiplier(time_of_day)
+        if time_of_day in (TimeOfDay.night, TimeOfDay.late_night):
+            activity = activity * 0.6
+            lighting = np.where(lighting < 0.5, lighting * 0.5, lighting)
+
+        lighting = np.minimum(1.0, lighting)
+        activity = np.minimum(1.0, activity)
+        police = np.minimum(1.0, police)
+        landmarks = np.minimum(1.0, (medical + transport) / 2)
+        cctv = np.full(n, 0.5)
+        road = np.full(n, 0.7) if road_type is None else np.asarray(road_type, dtype=float)
+
+        if preferences:
+            total = (
+                preferences.lighting
+                + preferences.police_stations
+                + preferences.busy_areas
+                + preferences.cctv_coverage
+                + preferences.safe_landmarks
+            )
+            weighted = (
+                lighting * preferences.lighting
+                + police * preferences.police_stations
+                + activity * preferences.busy_areas
+                + cctv * preferences.cctv_coverage
+                + landmarks * preferences.safe_landmarks
+            ) / total
+        else:
+            weighted = (
+                lighting * 0.2
+                + police * 0.2
+                + activity * 0.2
+                + cctv * 0.1
+                + landmarks * 0.15
+                + danger * 0.15
+            )
+
+        final = weighted * time_multiplier * danger
+        if road_type is not None:
+            # Street character from OSM highway tag: pedestrian streets and
+            # main roads keep their score, isolated paths are penalised.
+            final = final * (0.8 + 0.2 * road)
+
+        return {
+            "score": np.clip(final * 100, 0, 100),
+            "lighting": lighting,
+            "road_type": road,
+            "activity": activity,
+            "police_proximity": police,
+            "cctv_coverage": cctv,
+            "safe_landmarks": landmarks,
+            "time_factor": np.full(n, time_multiplier),
         }

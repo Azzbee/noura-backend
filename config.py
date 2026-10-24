@@ -3,8 +3,11 @@ Configuration for Noura Safe City Walks Backend
 """
 
 import os
+from pathlib import Path
 from typing import Optional
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_DATA_DIR = Path(__file__).resolve().parent / "data"
 
 
 class Settings(BaseSettings):
@@ -25,12 +28,21 @@ class Settings(BaseSettings):
         "http://localhost:5173",
         "http://localhost:3000",
         "http://localhost:8100",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
         "capacitor://localhost",
         "ionic://localhost",
     ]
 
     # OpenStreetMap Configuration
     OVERPASS_API_URL: str = "https://overpass-api.de/api/interpreter"
+    OVERPASS_TIMEOUT: int = 300  # seconds; the full Paris network is large
+    USE_LIVE_OSM_ZONES: bool = True  # add live OSM features to curated zones
+
+    # Data files
+    STREET_CACHE_PATH: str = str(_DATA_DIR / "paris_streets.json.gz")
+    STREET_CACHE_MAX_AGE: int = 7 * 86400  # refresh the street cache weekly
+    CURATED_ZONES_PATH: str = str(_DATA_DIR / "paris_safety_zones.json")
     NOMINATIM_API_URL: str = "https://nominatim.openstreetmap.org"
 
     # Caching
@@ -61,11 +73,12 @@ class Settings(BaseSettings):
     # Routing Configuration
     DEFAULT_WALKING_SPEED: float = 1.4  # meters per second
     MAX_ROUTE_DISTANCE: float = 10000  # 10km maximum route distance
+    # How strongly the safest route avoids less safe streets: at
+    # safety_weight=1 the least safe streets cost (1 + gain) x their length.
+    SAFETY_DETOUR_GAIN: float = 2.5
     SAFETY_RADIUS_SEARCH: float = 500  # meters to search for safety features
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
 
 
 settings = Settings()
